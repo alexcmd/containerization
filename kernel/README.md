@@ -7,6 +7,16 @@ This directory includes an optimized kernel configuration to produce a fast and 
 - `build.sh` scripts the kernel build process.
 - `image/` includes the configuration for an image with build tooling.
 
+## Kernel version
+
+The kernel must be Linux 7.2 or newer. The libkrun backend's Venus GPU device
+(`KrunGPUMode.venus`) needs the virtio-gpu driver to negotiate
+`VIRTIO_GPU_F_BLOB_ALIGNMENT`, which first shipped in 7.2. macOS hosts map
+host-visible blobs at 16 KiB, so on an older kernel a 4 KiB-page guest maps
+Venus's ring at the wrong alignment and `vkCreateInstance` fails with
+`VK_ERROR_OUT_OF_HOST_MEMORY`. The Virtualization.framework path itself has no
+such requirement.
+
 ## Building
 
 1. The build process relies on having the `container` tool installed (https://github.com/apple/container/releases).

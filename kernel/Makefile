@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-KSOURCE ?= https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.18.5.tar.xz
+KSOURCE ?= https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.2.15.tar.xz
 KIMAGE ?= kernel-build:0.1
 MAKEFILE_DIR := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
 GIT_VERSION := $(shell git -C $(MAKEFILE_DIR) rev-parse --short=12 HEAD 2>/dev/null || echo unknown)

@@ -14,7 +14,10 @@
 // limitations under the License.
 //===----------------------------------------------------------------------===//
 
-#if os(Linux)
+// Also built on macOS: the libkrun backend (`KrunVirtualMachineInstance`)
+// faces the same "socket must exist before the VMM starts" constraint and
+// reuses these slots for its guest→host vsock ports.
+#if os(Linux) || os(macOS)
 import ContainerizationError
 import Foundation
 import Logging
@@ -24,6 +27,8 @@ import Synchronization
 import Musl
 #elseif canImport(Glibc)
 import Glibc
+#elseif canImport(Darwin)
+import Darwin
 #endif
 
 /// One guest→host vsock listening socket, owned by the VM for its entire

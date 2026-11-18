@@ -171,6 +171,46 @@ extension Application {
         @Option(name: .long, help: "Current working directory")
         var cwd: String = "/"
 
+        @Option(name: .long, help: "VMM backend: vz (Virtualization.framework) or krun (libkrun, supports --gpu)")
+        var vmm: String = "vz"
+
+        @Option(name: .long, help: "GPU mode for --vmm krun: none or venus (Vulkan via virtio-gpu)")
+        var gpu: String = "none"
+
+        @Option(
+            name: .long, help: "initfs.ext4 path for --vmm krun (built by `make init`)", completion: .file(),
+            transform: { str in
+                URL(fileURLWithPath: str, relativeTo: .currentDirectory()).absoluteURL.path(percentEncoded: false)
+            })
+        var initfs: String?
+
+        @Option(name: .customLong("krun-vmm"), help: "Path to the krun-vmm helper (default: PATH lookup)", completion: .file())
+        var krunVMM: String?
+
+        static func gpuMode(_ name: String) throws -> KrunGPUMode {
+            switch name {
+            case "none": return .none
+            case "venus": return .venus
+            default: throw ValidationError("--gpu must be none or venus, got \(name)")
+            }
+        }
+
+        func validateBackend() throws {
+            guard vmm == "vz" || vmm == "krun" else {
+                throw ValidationError("--vmm must be vz or krun")
+            }
+            _ = try Self.gpuMode(gpu)
+            if vmm == "vz" && gpu != "none" {
+                throw ValidationError("--gpu requires --vmm krun")
+            }
+            if vmm == "krun" && initfs == nil {
+                throw ValidationError("--vmm krun requires --initfs <initfs.ext4>")
+            }
+            if vmm == "krun" && rosetta {
+                throw ValidationError("--rosetta is not supported with --vmm krun")
+            }
+        }
+
         @Option(
             name: .customLong("entrypoint"),
             help: """
@@ -194,26 +234,41 @@ extension Application {
             // Before the image pull: a bad path shouldn't cost a registry round
             // trip first.
             let seccompSelection = try SeccompFlags.resolve(seccomp: seccomp, profilePath: seccompProfile)
+            try validateBackend()
 
             let kernel = Kernel(
                 path: URL(fileURLWithPath: kernel),
                 platform: .linuxArm
             )
 
-            // Choose network implementation based on macOS version
+            let useKrun = vmm == "krun"
+
+            // Choose network implementation based on macOS version. The
+            // libkrun backend has no networking yet.
             let network: Network?
-            if #available(macOS 26, *) {
+            if !useKrun, #available(macOS 26, *) {
                 network = try VmnetNetwork()
             } else {
                 network = nil
             }
 
-            var manager = try await ContainerManager(
-                kernel: kernel,
-                initfsReference: "vminit:latest",
-                network: network,
-                rosetta: rosetta
-            )
+            var manager: ContainerManager
+            if useKrun, let initfs {
+                let krun = try KrunVirtualMachineManager(
+                    kernel: kernel,
+                    initialFilesystem: .block(format: "ext4", source: initfs, destination: "/", options: ["ro"]),
+                    helperBinary: krunVMM.map { URL(fileURLWithPath: $0) },
+                    gpu: try Self.gpuMode(gpu)
+                )
+                manager = try ContainerManager(vmm: krun, network: nil)
+            } else {
+                manager = try await ContainerManager(
+                    kernel: kernel,
+                    initfsReference: "vminit:latest",
+                    network: network,
+                    rosetta: rosetta
+                )
+            }
             let sigwinchStream = AsyncSignalHandler.create(notify: [SIGWINCH])
 
             // Get the actual image so we can parse out the ENTRYPOINT
@@ -234,7 +289,7 @@ extension Application {
                 image: image,
                 rootfsSizeInBytes: fsSizeInMB.mib(),
                 readOnly: readOnly,
-                networking: true,
+                networking: !useKrun,
                 // Give the VM memory headroom for the guest kernel and vminitd.
                 vm: VMResources(cpus: cpus, memoryInBytes: memory.mib() + VMResources.guestMemoryOverhead)
             ) { config in
@@ -321,7 +376,17 @@ extension Application {
                     }
                 }
 
-                let result = try await container.wait()
+                let result: ExitStatus
+                do {
+                    result = try await container.wait()
+                } catch {
+                    // The VM may have died (an out-of-process VMM such as
+                    // krun-vmm can crash on its own); still stop the container
+                    // so the backend releases its sockets and work directory.
+                    group.cancelAll()
+                    try? await container.stop()
+                    throw error
+                }
                 group.cancelAll()
 
                 try await container.stop()

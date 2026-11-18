@@ -472,6 +472,17 @@ fetch-cloud-hypervisor:
 	fi
 	@chmod +x bin/cloud-hypervisor
 
+# libkrun VMM helper for KrunVirtualMachineManager (macOS). Needs libkrun,
+# e.g. `brew install slp/krun/libkrun`. libkrun takes over the process that
+# boots the VM, so each VM runs in its own krun-vmm child process.
+KRUN_PREFIX ?= $(shell brew --prefix 2>/dev/null || echo /opt/homebrew)
+.PHONY: krun-vmm
+krun-vmm:
+	@mkdir -p bin
+	@clang -Wall -Wextra -Werror -O2 -I$(KRUN_PREFIX)/include -L$(KRUN_PREFIX)/lib -lkrun -o bin/krun-vmm krun/krun-vmm.c
+	@codesign --force --sign - --timestamp=none --entitlements=signing/krun.entitlements bin/krun-vmm
+	@echo "Built bin/krun-vmm"
+
 .PHONY: fetch-runc
 # Downloads to a .tmp path and only moves it into place after the checksum
 # passes: nothing downstream re-validates the binary, it is staged into the
