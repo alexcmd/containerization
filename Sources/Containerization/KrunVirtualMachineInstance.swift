@@ -50,6 +50,9 @@ public final class KrunVirtualMachineInstance: Sendable {
         public var kernel: Kernel?
         public var initialFilesystem: Mount?
         public var gpu: KrunGPUMode = .none
+        public var display: KrunDisplay?
+        /// gvproxy binary, required when `interfaces` is non-empty.
+        public var gvproxyBinary: URL?
         /// libkrun log level, 0 (off) to 5 (trace).
         public var logLevel: Int = 1
 
@@ -85,6 +88,8 @@ public final class KrunVirtualMachineInstance: Sendable {
     var agentSocket: URL { workDir.appendingPathComponent("agent.sock") }
     var consoleLog: URL { workDir.appendingPathComponent("console.log") }
     var vmmLog: URL { workDir.appendingPathComponent("vmm.log") }
+    /// gvproxy's datagram socket; `net.sock.api` is its services API.
+    var netSocket: URL { workDir.appendingPathComponent("net.sock") }
 
     init(
         group: (any EventLoopGroup)?,
@@ -97,8 +102,13 @@ public final class KrunVirtualMachineInstance: Sendable {
             throw ContainerizationError(.invalidArgument, message: "libkrun VM needs a kernel and an initial filesystem")
         }
         if !config.interfaces.isEmpty {
-            // TODO: wire krun_add_net_unixgram to vmnet-helper/gvproxy.
-            throw ContainerizationError(.unsupported, message: "network interfaces are not supported by the libkrun backend yet")
+            guard config.interfaces.count == 1, config.interfaces[0] is GvproxyInterface else {
+                throw ContainerizationError(
+                    .unsupported, message: "the libkrun backend supports one GvproxyInterface (use GvproxyNetwork)")
+            }
+            guard config.gvproxyBinary != nil else {
+                throw ContainerizationError(.invalidArgument, message: "networking needs a gvproxy binary")
+            }
         }
 
         // Short random name: the per-port socket paths must stay under the
@@ -252,7 +262,15 @@ extension KrunVirtualMachineInstance {
         for port in _stdioPool.withLock({ $0.keys.sorted() }) {
             args += ["--vsock-listen", "\(port):\(stdioSocketPath(port).path)"]
         }
+        if let iface = config.interfaces.first as? GvproxyInterface, let gvproxy = config.gvproxyBinary,
+            let mac = iface.macAddress
+        {
+            args += ["--gvproxy", gvproxy.path, "--net-socket", netSocket.path, "--net-mac", mac.description]
+        }
         args += config.gpu.helperArguments
+        if let display = config.display {
+            args += display.helperArguments
+        }
         return args
     }
 

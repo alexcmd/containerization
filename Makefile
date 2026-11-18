@@ -479,7 +479,7 @@ KRUN_PREFIX ?= $(shell brew --prefix 2>/dev/null || echo /opt/homebrew)
 .PHONY: krun-vmm
 krun-vmm:
 	@mkdir -p bin
-	@clang -Wall -Wextra -Werror -O2 -I$(KRUN_PREFIX)/include -L$(KRUN_PREFIX)/lib -lkrun -o bin/krun-vmm krun/krun-vmm.c
+	@clang -Wall -Wextra -Werror -O2 -fobjc-arc -I$(KRUN_PREFIX)/include -L$(KRUN_PREFIX)/lib -Wl,-rpath,$(KRUN_PREFIX)/lib -lkrun -framework Cocoa -framework ImageIO -framework IOSurface -framework QuartzCore -o bin/krun-vmm krun/krun-vmm.c krun/krun-display.m
 	@codesign --force --sign - --timestamp=none --entitlements=signing/krun.entitlements bin/krun-vmm
 	@echo "Built bin/krun-vmm"
 

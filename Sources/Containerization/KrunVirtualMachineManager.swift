@@ -56,6 +56,26 @@ public enum KrunGPUMode: Sendable, Equatable {
     }
 }
 
+/// A window on the host showing the guest's virtio-gpu output, with a
+/// virtio-input keyboard and pointer fed from it. Needs a GPU mode other than
+/// `.none`; the guest draws to it through DRM/KMS (fbcon, or a compositor
+/// such as weston).
+public struct KrunDisplay: Sendable, Equatable {
+    public var width: UInt32
+    public var height: UInt32
+    public var title: String
+
+    public init(width: UInt32, height: UInt32, title: String = "container") {
+        self.width = width
+        self.height = height
+        self.title = title
+    }
+
+    var helperArguments: [String] {
+        ["--display", "\(width)x\(height)", "--title", title]
+    }
+}
+
 /// A `VirtualMachineManager` that runs each VM under libkrun via the
 /// `krun-vmm` helper binary (libkrun takes over the calling process, so the
 /// VM cannot run in-process).
@@ -68,6 +88,8 @@ public struct KrunVirtualMachineManager: VirtualMachineManager {
     private let helperBinary: URL
     private let runtimeRoot: URL
     private let gpu: KrunGPUMode
+    private let display: KrunDisplay?
+    private let gvproxyBinary: URL?
     private let group: (any EventLoopGroup)?
     private let logger: Logger?
 
@@ -79,12 +101,17 @@ public struct KrunVirtualMachineManager: VirtualMachineManager {
     ///   - runtimeRoot: Directory for per-VM sockets. Keep it short: macOS
     ///     limits UNIX socket paths to 104 bytes.
     ///   - gpu: GPU exposure mode.
+    ///   - display: Opens a host window for the guest's screen. Needs `gpu`.
+    ///   - gvproxyBinary: gvproxy for `GvproxyNetwork` interfaces. Defaults to
+    ///     `gvproxy` on `PATH`, then the copy bundled with Homebrew's podman.
     public init(
         kernel: Kernel,
         initialFilesystem: Mount,
         helperBinary: URL? = nil,
         runtimeRoot: URL? = nil,
         gpu: KrunGPUMode = .none,
+        display: KrunDisplay? = nil,
+        gvproxyBinary: URL? = nil,
         group: (any EventLoopGroup)? = nil,
         logger: Logger? = nil
     ) throws {
@@ -106,7 +133,12 @@ public struct KrunVirtualMachineManager: VirtualMachineManager {
             throw ContainerizationError(.invalidState, message: "runtime root \(runtimeRoot.path) must be a directory owned by uid \(getuid()) with mode 0700")
         }
         self.runtimeRoot = runtimeRoot
+        if display != nil && gpu == .none {
+            throw ContainerizationError(.invalidArgument, message: "a display needs a GPU mode other than .none")
+        }
         self.gpu = gpu
+        self.display = display
+        self.gvproxyBinary = gvproxyBinary ?? Self.findGvproxy()
         self.group = group
         self.logger = logger
     }
@@ -126,6 +158,8 @@ public struct KrunVirtualMachineManager: VirtualMachineManager {
         instanceConfig.kernel = kernel
         instanceConfig.initialFilesystem = initialFilesystem
         instanceConfig.gpu = gpu
+        instanceConfig.display = display
+        instanceConfig.gvproxyBinary = gvproxyBinary
 
         return try KrunVirtualMachineInstance(
             group: group,
@@ -147,6 +181,17 @@ public struct KrunVirtualMachineManager: VirtualMachineManager {
         }
         let base = String(decoding: buffer.prefix(len - 1).map { UInt8(bitPattern: $0) }, as: UTF8.self)
         return URL(fileURLWithPath: base).appendingPathComponent("krun")
+    }
+
+    static func findGvproxy() -> URL? {
+        if let url = try? resolveBinary(nil, name: "gvproxy") {
+            return url
+        }
+        for path in ["/opt/homebrew/opt/podman/libexec/podman/gvproxy", "/usr/local/opt/podman/libexec/podman/gvproxy"]
+        where FileManager.default.isExecutableFile(atPath: path) {
+            return URL(fileURLWithPath: path)
+        }
+        return nil
     }
 
     static func resolveBinary(_ override: URL?, name: String) throws -> URL {

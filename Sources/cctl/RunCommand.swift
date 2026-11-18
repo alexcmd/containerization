@@ -177,6 +177,12 @@ extension Application {
         @Option(name: .long, help: "GPU mode for --vmm krun: none or venus (Vulkan via virtio-gpu)")
         var gpu: String = "none"
 
+        @Option(name: .long, help: "Open a window WIDTHxHEIGHT showing the guest screen (--vmm krun --gpu venus)")
+        var display: String?
+
+        @Flag(name: .customLong("no-network"), help: "--vmm krun: no network interface (default: gvproxy NAT)")
+        var noNetwork: Bool = false
+
         @Option(
             name: .long, help: "initfs.ext4 path for --vmm krun (built by `make init`)", completion: .file(),
             transform: { str in
@@ -195,6 +201,16 @@ extension Application {
             }
         }
 
+        static func parseDisplay(_ spec: String, title: String) throws -> KrunDisplay {
+            let parts = spec.split(separator: "x")
+            guard parts.count == 2, let w = UInt32(parts[0]), let h = UInt32(parts[1]), (64...8192).contains(w),
+                (64...8192).contains(h)
+            else {
+                throw ValidationError("--display must be WIDTHxHEIGHT, e.g. 1280x800, got \(spec)")
+            }
+            return KrunDisplay(width: w, height: h, title: title)
+        }
+
         func validateBackend() throws {
             guard vmm == "vz" || vmm == "krun" else {
                 throw ValidationError("--vmm must be vz or krun")
@@ -202,6 +218,12 @@ extension Application {
             _ = try Self.gpuMode(gpu)
             if vmm == "vz" && gpu != "none" {
                 throw ValidationError("--gpu requires --vmm krun")
+            }
+            if let display {
+                _ = try Self.parseDisplay(display, title: id)
+                if vmm != "krun" || gpu == "none" {
+                    throw ValidationError("--display requires --vmm krun and a --gpu mode")
+                }
             }
             if vmm == "krun" && initfs == nil {
                 throw ValidationError("--vmm krun requires --initfs <initfs.ext4>")
@@ -244,7 +266,7 @@ extension Application {
             let useKrun = vmm == "krun"
 
             // Choose network implementation based on macOS version. The
-            // libkrun backend has no networking yet.
+            // libkrun backend brings its own (gvproxy, set up below).
             let network: Network?
             if !useKrun, #available(macOS 26, *) {
                 network = try VmnetNetwork()
@@ -258,9 +280,10 @@ extension Application {
                     kernel: kernel,
                     initialFilesystem: .block(format: "ext4", source: initfs, destination: "/", options: ["ro"]),
                     helperBinary: krunVMM.map { URL(fileURLWithPath: $0) },
-                    gpu: try Self.gpuMode(gpu)
+                    gpu: try Self.gpuMode(gpu),
+                    display: try display.map { try Self.parseDisplay($0, title: id) }
                 )
-                manager = try ContainerManager(vmm: krun, network: nil)
+                manager = try ContainerManager(vmm: krun, network: noNetwork ? nil : GvproxyNetwork())
             } else {
                 manager = try await ContainerManager(
                     kernel: kernel,
@@ -289,7 +312,7 @@ extension Application {
                 image: image,
                 rootfsSizeInBytes: fsSizeInMB.mib(),
                 readOnly: readOnly,
-                networking: !useKrun,
+                networking: useKrun ? !noNetwork : true,
                 // Give the VM memory headroom for the guest kernel and vminitd.
                 vm: VMResources(cpus: cpus, memoryInBytes: memory.mib() + VMResources.guestMemoryOverhead)
             ) { config in
@@ -317,7 +340,10 @@ extension Application {
                 }
 
                 var hosts = Hosts.default
-                if !nameservers.isEmpty {
+                if useKrun, let gv = config.interfaces.first as? GvproxyInterface {
+                    // gvproxy answers DNS on its gateway address.
+                    config.dns = DNS(nameservers: nameservers.isEmpty ? [gv.nameserver] : nameservers)
+                } else if !nameservers.isEmpty {
                     if #available(macOS 26, *) {
                         config.dns = DNS(nameservers: nameservers)
                     } else {
