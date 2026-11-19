@@ -1,0 +1,21 @@
+--- a/drivers/gpu/drm/virtio/virtgpu_ioctl.c
++++ b/drivers/gpu/drm/virtio/virtgpu_ioctl.c
+@@ -539,9 +539,15 @@
+ 	params->blob_flags = rc_blob->blob_flags;
+ 	params->blob_hints = rc_blob->blob_hints;
+ 
+-	if (vgdev->has_blob_alignment &&
+-	    !IS_ALIGNED(params->size, vgdev->blob_alignment))
+-		return -EINVAL;
++	/*
++	 * Round up rather than reject: userspace that predates
++	 * VIRTGPU_PARAM_BLOB_ALIGNMENT (e.g. Mesa Venus before 26.2.4) sizes
++	 * blobs to the guest page size, and on a host with larger pages
++	 * (16 KiB on Apple silicon) every such blob would fail with -EINVAL.
++	 * The extra tail is never mapped by those callers.
++	 */
++	if (vgdev->has_blob_alignment)
++		params->size = ALIGN(params->size, vgdev->blob_alignment);
+ 
+ 	return 0;
+ }

@@ -40,6 +40,13 @@ esac
 
 mkdir -p /kbuild
 tar -xf /kernel/source.tar.xz -C /kbuild --strip-components=1
+
+# Local fixes on top of the release tarball (kernel/patches/*.patch, -p1).
+for p in /kernel/patches/*.patch; do
+  [ -e "$p" ] || continue
+  echo "applying ${p##*/}"
+  patch -d /kbuild -p1 --forward < "$p" || exit 1
+done
 cp "/kernel/${CONFIG}" /kbuild/.config
 
 (
