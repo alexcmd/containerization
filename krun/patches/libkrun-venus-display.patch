@@ -1,0 +1,437 @@
+diff --git a/include/libkrun.h b/include/libkrun.h
+index e6d44ba..fa7c4fe 100644
+--- a/include/libkrun.h
++++ b/include/libkrun.h
+@@ -740,6 +740,13 @@ int32_t krun_display_set_physical_size(uint32_t ctx_id, uint32_t display_id, uin
+  */
+ int32_t krun_display_set_refresh_rate(uint32_t ctx_id, uint32_t display_id, uint32_t refresh_rate);
+ 
++/*
++ * Resizes display `display_id` of a running VM (e.g. after the host window was resized).
++ * The guest is notified via VIRTIO_GPU_EVENT_DISPLAY and switches to the new size.
++ * Callable from any thread while the VM runs. Size must be 320x200..8192x8192.
++ */
++int32_t krun_display_resize(uint32_t ctx_id, uint32_t display_id, uint32_t width, uint32_t height);
++
+ /**
+  * Configures a krun_display_backend struct to be used for display output. (see libkrun_display.h)
+  *
+diff --git a/src/devices/src/virtio/gpu/device.rs b/src/devices/src/virtio/gpu/device.rs
+index d666cf3..6078760 100644
+--- a/src/devices/src/virtio/gpu/device.rs
++++ b/src/devices/src/virtio/gpu/device.rs
+@@ -169,7 +169,7 @@ impl VirtioDevice for Gpu {
+ 
+     fn read_config(&self, offset: u64, mut data: &mut [u8]) {
+         let config = virtio_gpu_config {
+-            events_read: 0,
++            events_read: super::display::resize::events(),
+             events_clear: 0,
+             num_scanouts: self.displays.len() as u32,
+             num_capsets: 5,
+@@ -190,6 +190,13 @@ impl VirtioDevice for Gpu {
+     }
+ 
+     fn write_config(&mut self, offset: u64, data: &[u8]) {
++        // virtio_gpu_config.events_clear is the u32 at offset 4: the guest acks
++        // VIRTIO_GPU_EVENT_DISPLAY after re-reading display info.
++        if offset == 4 && data.len() == 4 {
++            let mask = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
++            super::display::resize::clear_events(mask);
++            return;
++        }
+         warn!(
+             "gpu: guest driver attempted to write device config (offset={:x}, len={:x})",
+             offset,
+@@ -203,7 +210,7 @@ impl VirtioDevice for Gpu {
+         interrupt: InterruptTransport,
+         queues: Vec<DeviceQueue>,
+     ) -> ActivateResult {
+-        let [control_q, _cursor_q]: [_; defs::NUM_QUEUES] = queues.try_into().map_err(|_| {
++        let [control_q, cursor_q]: [_; defs::NUM_QUEUES] = queues.try_into().map_err(|_| {
+             error!(
+                 "Cannot perform activate. Expected {} queue(s)",
+                 defs::NUM_QUEUES
+@@ -216,7 +223,8 @@ impl VirtioDevice for Gpu {
+             None => panic!("virtio_gpu: missing SHM region"),
+         };
+ 
+-        // cursor queue not used by worker
++        super::worker::run_cursor_drain(cursor_q, mem.clone(), interrupt.clone());
++        super::display::resize::set_interrupt(interrupt.clone());
+         let worker = Worker::new(
+             control_q,
+             mem.clone(),
+diff --git a/src/devices/src/virtio/gpu/display.rs b/src/devices/src/virtio/gpu/display.rs
+index 5bc6b17..fed48d3 100644
+--- a/src/devices/src/virtio/gpu/display.rs
++++ b/src/devices/src/virtio/gpu/display.rs
+@@ -62,6 +62,62 @@ impl DisplayInfo {
+ 
+ pub const MAX_DISPLAYS: usize = VIRTIO_GPU_MAX_SCANOUTS as usize;
+ 
++/// Runtime display resizing (host window resized -> guest picks a new mode).
++///
++/// The host records the new size and raises VIRTIO_GPU_EVENT_DISPLAY through a
++/// config-change interrupt; the guest driver then re-reads GET_DISPLAY_INFO and
++/// GET_EDID, sends a hotplug uevent, and the compositor switches to the new
++/// preferred mode. One VM per process, so a process-wide state is sufficient.
++pub mod resize {
++    use crate::virtio::InterruptTransport;
++    use std::sync::atomic::{AtomicU32, Ordering};
++    use std::sync::Mutex;
++
++    use super::MAX_DISPLAYS;
++
++    pub const EVENT_DISPLAY: u32 = 1 << 0;
++
++    static SIZES: Mutex<[Option<(u32, u32)>; MAX_DISPLAYS]> = Mutex::new([None; MAX_DISPLAYS]);
++    static EVENTS: AtomicU32 = AtomicU32::new(0);
++    static INTERRUPT: Mutex<Option<InterruptTransport>> = Mutex::new(None);
++
++    pub fn set_interrupt(interrupt: InterruptTransport) {
++        *INTERRUPT.lock().unwrap() = Some(interrupt);
++    }
++
++    /// Current size of `scanout`, if the host has resized it since boot.
++    pub fn current(scanout: usize) -> Option<(u32, u32)> {
++        SIZES.lock().unwrap().get(scanout).copied().flatten()
++    }
++
++    pub fn events() -> u32 {
++        EVENTS.load(Ordering::SeqCst)
++    }
++
++    pub fn clear_events(mask: u32) {
++        EVENTS.fetch_and(!mask, Ordering::SeqCst);
++    }
++
++    /// Returns false if the scanout index is out of range.
++    pub fn request(scanout: usize, width: u32, height: u32) -> bool {
++        {
++            let mut sizes = SIZES.lock().unwrap();
++            let Some(slot) = sizes.get_mut(scanout) else {
++                return false;
++            };
++            if *slot == Some((width, height)) {
++                return true;
++            }
++            *slot = Some((width, height));
++        }
++        EVENTS.fetch_or(EVENT_DISPLAY, Ordering::SeqCst);
++        if let Some(interrupt) = INTERRUPT.lock().unwrap().as_ref() {
++            interrupt.signal_config_change();
++        }
++        true
++    }
++}
++
+ pub struct NoopDisplayBackend;
+ 
+ impl DisplayBackendNew<()> for NoopDisplayBackend {
+diff --git a/src/devices/src/virtio/gpu/virtio_gpu.rs b/src/devices/src/virtio/gpu/virtio_gpu.rs
+index 68a45f8..67c1328 100644
+--- a/src/devices/src/virtio/gpu/virtio_gpu.rs
++++ b/src/devices/src/virtio/gpu/virtio_gpu.rs
+@@ -570,7 +570,18 @@ impl VirtioGpu {
+         Ok(OkNoData)
+     }
+ 
+-    pub fn display_info(&self) -> VirtioGpuResult {
++    /// Apply host-side resize requests (window resized) to our display table.
++    fn sync_display_sizes(&mut self) {
++        for (i, d) in self.displays.iter_mut().enumerate() {
++            if let Some((w, h)) = crate::virtio::display::resize::current(i) {
++                d.width = w;
++                d.height = h;
++            }
++        }
++    }
++
++    pub fn display_info(&mut self) -> VirtioGpuResult {
++        self.sync_display_sizes();
+         let display_info = self
+             .displays
+             .iter()
+@@ -580,7 +591,8 @@ impl VirtioGpu {
+         Ok(OkDisplayInfo(display_info))
+     }
+ 
+-    pub fn get_edid(&self, scanout_id: u32) -> VirtioGpuResult {
++    pub fn get_edid(&mut self, scanout_id: u32) -> VirtioGpuResult {
++        self.sync_display_sizes();
+         let display = self
+             .displays
+             .get(scanout_id as usize)
+diff --git a/src/devices/src/virtio/gpu/worker.rs b/src/devices/src/virtio/gpu/worker.rs
+index f32d68e..c2fecc2 100644
+--- a/src/devices/src/virtio/gpu/worker.rs
++++ b/src/devices/src/virtio/gpu/worker.rs
+@@ -383,7 +383,7 @@ impl Worker {
+                     Err(e) => debug!("descriptor decode error: {e:?}"),
+                 }
+ 
+-                let mut gpu_response = match resp {
++                let gpu_response = match resp {
+                     Ok(gpu_response) => gpu_response,
+                     Err(gpu_response) => {
+                         debug!("{gpu_cmd:?} -> {gpu_response:?}");
+@@ -398,6 +398,7 @@ impl Worker {
+                     let mut ctx_id = 0;
+                     let mut flags = 0;
+                     let mut ring_idx = 0;
++                    let mut fence_retired_now = false;
+                     if let Some(_cmd) = gpu_cmd {
+                         let ctrl_hdr = ctrl_hdr.unwrap();
+                         if ctrl_hdr.flags & VIRTIO_GPU_FLAG_FENCE != 0 {
+@@ -412,13 +413,16 @@ impl Worker {
+                                 ctx_id,
+                                 ring_idx,
+                             };
+-                            gpu_response = match virtio_gpu.create_fence(fence) {
+-                                Ok(_) => gpu_response,
+-                                Err(fence_resp) => {
+-                                    warn!("create_fence {fence_id} -> {fence_resp:?}");
+-                                    fence_resp
+-                                }
+-                            };
++                            // A renderer without a ctx0 timeline (e.g. Venus-only
++                            // virglrenderer: no vrend) rejects global fences. The
++                            // command already ran synchronously, so retire the
++                            // fence now by returning the response immediately;
++                            // parking it would wait forever and wedge the guest
++                            // (cursor-plane updates wait on these fences).
++                            if let Err(fence_resp) = virtio_gpu.create_fence(fence) {
++                                debug!("create_fence {fence_id} -> {fence_resp:?}; retiring now");
++                                fence_retired_now = true;
++                            }
+                         }
+                     }
+ 
+@@ -429,7 +433,7 @@ impl Worker {
+                         Err(e) => debug!("ctrl queue response encode error: {e:?}"),
+                     }
+ 
+-                    if flags & VIRTIO_GPU_FLAG_FENCE != 0 {
++                    if flags & VIRTIO_GPU_FLAG_FENCE != 0 && !fence_retired_now {
+                         let ring = match flags & VIRTIO_GPU_FLAG_INFO_RING_IDX {
+                             0 => VirtioGpuRing::Global,
+                             _ => VirtioGpuRing::ContextSpecific { ctx_id, ring_idx },
+@@ -458,3 +462,37 @@ impl Worker {
+         used_any
+     }
+ }
++
++/// Drain the cursor queue. UPDATE_CURSOR / MOVE_CURSOR carry no response and the
++/// host draws its own pointer, so each descriptor is returned immediately. If the
++/// queue is never serviced, the guest's cursor vq fills up, virtio_gpu_cursor_ping
++/// blocks in the kernel, and every display commit behind it hangs.
++pub fn run_cursor_drain(cursor_q: DeviceQueue, mem: GuestMemoryMmap, interrupt: InterruptTransport) {
++    let evt = cursor_q.event.try_clone().unwrap();
++    // SAFETY: evt is valid for the duration of the fcntl calls.
++    let fd = unsafe { BorrowedFd::borrow_raw(evt.as_raw_fd()) };
++    let flags = OFlag::from_bits_retain(fcntl(fd, FcntlArg::F_GETFL).unwrap()) & !OFlag::O_NONBLOCK;
++    fcntl(fd, FcntlArg::F_SETFL(flags)).unwrap();
++    let mut queue = cursor_q.queue;
++    thread::Builder::new()
++        .name("gpu cursor".into())
++        .spawn(move || loop {
++            if let Err(e) = evt.read() {
++                error!("Failed to read cursor_evt: {e:?}");
++                continue;
++            }
++            let mut used_any = false;
++            while let Some(head) = queue.pop(&mem) {
++                if let Err(e) = queue.add_used(&mem, head.index, 0) {
++                    error!("cursor queue add_used failed: {e:?}");
++                }
++                used_any = true;
++            }
++            if used_any {
++                if let Err(e) = interrupt.try_signal_used_queue() {
++                    error!("Error signaling cursor queue: {e:?}");
++                }
++            }
++        })
++        .unwrap();
++}
+diff --git a/src/libkrun/src/lib.rs b/src/libkrun/src/lib.rs
+index cd98467..0a394b9 100644
+--- a/src/libkrun/src/lib.rs
++++ b/src/libkrun/src/lib.rs
+@@ -1749,6 +1749,28 @@ pub unsafe extern "C" fn krun_add_display(_ctx_id: u32, _width: u32, _height: u3
+     -libc::ENOTSUP
+ }
+ 
++/// Resize display `display_id` of a running VM (e.g. its host window was resized).
++/// The guest is notified with VIRTIO_GPU_EVENT_DISPLAY and picks up the new
++/// size as its preferred mode. Safe to call from any thread after krun_start_enter.
++#[cfg(feature = "gpu")]
++#[no_mangle]
++pub extern "C" fn krun_display_resize(_ctx_id: u32, display_id: u32, width: u32, height: u32) -> i32 {
++    if width < 320 || height < 200 || width > 8192 || height > 8192 {
++        return -libc::EINVAL;
++    }
++    if devices::virtio::display::resize::request(display_id as usize, width, height) {
++        KRUN_SUCCESS
++    } else {
++        -libc::EINVAL
++    }
++}
++
++#[cfg(not(feature = "gpu"))]
++#[no_mangle]
++pub extern "C" fn krun_display_resize(_ctx_id: u32, _display_id: u32, _width: u32, _height: u32) -> i32 {
++    -libc::ENOTSUP
++}
++
+ #[cfg(feature = "gpu")]
+ #[no_mangle]
+ pub extern "C" fn krun_display_set_refresh_rate(
+diff --git a/src/rutabaga_gfx/src/rutabaga_core.rs b/src/rutabaga_gfx/src/rutabaga_core.rs
+index f5b349a..badc383 100644
+--- a/src/rutabaga_gfx/src/rutabaga_core.rs
++++ b/src/rutabaga_gfx/src/rutabaga_core.rs
+@@ -357,9 +357,23 @@ pub struct Rutabaga {
+     default_component: RutabagaComponentType,
+     capset_info: Vec<RutabagaCapsetInfo>,
+     fence_handler: RutabagaFenceHandler,
++    // virglrenderer runs without its GL renderer (Venus only): classic
++    // resources (dumb buffers for KMS scanout) are kept by Rutabaga2D on the CPU.
++    classic_in_2d: bool,
+ }
+ 
+ impl Rutabaga {
++    /// The component that owns `resource_id`: Rutabaga2D for resources it
++    /// created, otherwise the default component.
++    fn component_for(&self, resource_id: u32) -> RutabagaComponentType {
++        match self.resources.get(&resource_id) {
++            Some(r) if r.component_mask == 1 << (RutabagaComponentType::Rutabaga2D as u8) => {
++                RutabagaComponentType::Rutabaga2D
++            }
++            _ => self.default_component,
++        }
++    }
++
+     /// Take a snapshot of Rutabaga's current state. The snapshot is serialized into an opaque byte
+     /// stream and written to `w`.
+     ///
+@@ -592,9 +606,14 @@ impl Rutabaga {
+         resource_id: u32,
+         resource_create_3d: ResourceCreate3D,
+     ) -> RutabagaResult<()> {
++        let component_type = if self.classic_in_2d {
++            RutabagaComponentType::Rutabaga2D
++        } else {
++            self.default_component
++        };
+         let component = self
+             .components
+-            .get_mut(&self.default_component)
++            .get_mut(&component_type)
+             .ok_or(RutabagaError::InvalidComponent)?;
+ 
+         if self.resources.contains_key(&resource_id) {
+@@ -612,9 +631,10 @@ impl Rutabaga {
+         resource_id: u32,
+         mut vecs: Vec<RutabagaIovec>,
+     ) -> RutabagaResult<()> {
++        let component_type = self.component_for(resource_id);
+         let component = self
+             .components
+-            .get_mut(&self.default_component)
++            .get_mut(&component_type)
+             .ok_or(RutabagaError::InvalidComponent)?;
+ 
+         let resource = self
+@@ -629,9 +649,10 @@ impl Rutabaga {
+ 
+     /// Detaches any previously attached iovecs from the resource.
+     pub fn detach_backing(&mut self, resource_id: u32) -> RutabagaResult<()> {
++        let component_type = self.component_for(resource_id);
+         let component = self
+             .components
+-            .get_mut(&self.default_component)
++            .get_mut(&component_type)
+             .ok_or(RutabagaError::InvalidComponent)?;
+ 
+         let resource = self
+@@ -646,9 +667,10 @@ impl Rutabaga {
+ 
+     /// Releases guest kernel reference on the resource.
+     pub fn unref_resource(&mut self, resource_id: u32) -> RutabagaResult<()> {
++        let component_type = self.component_for(resource_id);
+         let component = self
+             .components
+-            .get_mut(&self.default_component)
++            .get_mut(&component_type)
+             .ok_or(RutabagaError::InvalidComponent)?;
+ 
+         self.resources
+@@ -667,9 +689,10 @@ impl Rutabaga {
+         resource_id: u32,
+         transfer: Transfer3D,
+     ) -> RutabagaResult<()> {
++        let component_type = self.component_for(resource_id);
+         let component = self
+             .components
+-            .get(&self.default_component)
++            .get(&component_type)
+             .ok_or(RutabagaError::InvalidComponent)?;
+ 
+         let resource = self
+@@ -691,9 +714,10 @@ impl Rutabaga {
+         transfer: Transfer3D,
+         buf: Option<IoSliceMut>,
+     ) -> RutabagaResult<()> {
++        let component_type = self.component_for(resource_id);
+         let component = self
+             .components
+-            .get(&self.default_component)
++            .get(&component_type)
+             .ok_or(RutabagaError::InvalidComponent)?;
+ 
+         let resource = self
+@@ -705,9 +729,10 @@ impl Rutabaga {
+     }
+ 
+     pub fn resource_flush(&mut self, resource_id: u32) -> RutabagaResult<()> {
++        let component_type = self.component_for(resource_id);
+         let component = self
+             .components
+-            .get(&self.default_component)
++            .get(&component_type)
+             .ok_or(RutabagaError::Unsupported)?;
+ 
+         let resource = self
+@@ -1184,6 +1209,9 @@ impl RutabagaBuilder {
+         fence_handler: RutabagaFenceHandler,
+         #[allow(unused_variables)] rutabaga_server_descriptor: Option<SafeDescriptor>,
+     ) -> RutabagaResult<Rutabaga> {
++        // VIRGLRENDERER_NO_VIRGL (1 << 7): no GL renderer behind classic resources.
++        let classic_in_2d = self.default_component == RutabagaComponentType::VirglRenderer
++            && (i32::from(self.virglrenderer_flags) as u32) & (1 << 7) != 0;
+         let mut rutabaga_components: Map<RutabagaComponentType, Box<dyn RutabagaComponent>> =
+             Default::default();
+ 
+@@ -1268,6 +1296,12 @@ impl RutabagaBuilder {
+                     rutabaga_server_descriptor,
+                 )?;
+                 rutabaga_components.insert(RutabagaComponentType::VirglRenderer, virgl);
++                if classic_in_2d {
++                    rutabaga_components.insert(
++                        RutabagaComponentType::Rutabaga2D,
++                        Rutabaga2D::init(fence_handler.clone())?,
++                    );
++                }
+ 
+                 push_capset(RUTABAGA_CAPSET_VIRGL);
+                 push_capset(RUTABAGA_CAPSET_VIRGL2);
+@@ -1309,6 +1343,7 @@ impl RutabagaBuilder {
+             default_component: self.default_component,
+             capset_info: rutabaga_capsets,
+             fence_handler,
++            classic_in_2d,
+         })
+     }
+ }

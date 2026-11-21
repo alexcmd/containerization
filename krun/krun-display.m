@@ -967,7 +967,34 @@ static void send_key(uint16_t code, bool down) {
 @interface KrunAppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate>
 @end
 
+static uint32_t g_ctx;
+static uint32_t g_req_w, g_req_h; // last size sent to the guest (main thread)
+
+// Tell the guest the window's new size (1 point = 1 guest pixel, matching the
+// initial window). libkrun raises VIRTIO_GPU_EVENT_DISPLAY; the guest re-reads
+// the display info and EDID and its compositor switches to the new mode.
+// Sent once a live resize ends (not per frame of the drag), and on
+// zoom/fullscreen, which resize without a live-resize phase.
+static void request_guest_resize(void) {
+    NSSize s = g_window.contentView.bounds.size;
+    uint32_t w = (uint32_t)s.width & ~7u, h = (uint32_t)s.height & ~1u;
+    if (w < 320 || h < 200 || (w == g_req_w && h == g_req_h)) return;
+    int rc = krun_display_resize(g_ctx, 0, w, h);
+    if (rc < 0) {
+        fprintf(stderr, "krun-vmm: display: resize to %ux%u failed (%d)\n", w, h, rc);
+        return;
+    }
+    g_req_w = w;
+    g_req_h = h;
+    fprintf(stderr, "krun-vmm: display: asked guest for %ux%u\n", w, h);
+}
+
 @implementation KrunAppDelegate
+- (void)windowDidEndLiveResize:(NSNotification *)n { (void)n; request_guest_resize(); }
+- (void)windowDidResize:(NSNotification *)n {
+    (void)n;
+    if (!g_window.inLiveResize) request_guest_resize();
+}
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)app { (void)app; return YES; }
 - (void)applicationWillTerminate:(NSNotification *)n {
     (void)n;
@@ -984,6 +1011,9 @@ static struct krun_input_event_provider g_kbd_ev, g_ptr_ev;
 int krun_display_configure(uint32_t ctx, uint32_t width, uint32_t height) {
     g_display_w = width;
     g_display_h = height;
+    g_ctx = ctx;
+    g_req_w = width;
+    g_req_h = height;
     if (!queue_init(&g_kbd) || !queue_init(&g_ptr)) return -errno;
 
     memset(&g_display_backend, 0, sizeof g_display_backend);
@@ -995,6 +1025,15 @@ int krun_display_configure(uint32_t ctx, uint32_t width, uint32_t height) {
         .present_frame = d_present_frame,
     };
     int rc = krun_add_display(ctx, width, height);
+    if (rc < 0) return rc;
+    // One guest pixel is one macOS point (~110 per inch on Mac screens). The
+    // EDID default of 300 DPI makes mutter treat every new size as a HiDPI
+    // panel and fall back to 200% scale after each resize. Override with
+    // KRUN_DISPLAY_DPI (e.g. 220 to get 2x when the window is sized in pixels).
+    uint32_t dpi = 110;
+    const char *dpi_env = getenv("KRUN_DISPLAY_DPI");
+    if (dpi_env && atoi(dpi_env) > 0) dpi = (uint32_t)atoi(dpi_env);
+    rc = krun_display_set_dpi(ctx, (uint32_t)rc, dpi);
     if (rc < 0) return rc;
     rc = krun_set_display_backend(ctx, &g_display_backend, sizeof g_display_backend);
     if (rc < 0) return rc;
@@ -1067,7 +1106,10 @@ void krun_display_run(const char *title, void (*vm_main)(void *), void *arg) {
                         backing:NSBackingStoreBuffered
                           defer:NO];
         g_window.title = [NSString stringWithUTF8String:title];
-        g_window.contentAspectRatio = NSMakeSize(g_display_w, g_display_h);
+        // Free resizing: the guest follows the window size (request_guest_resize).
+        // Until it catches up, the layer letterboxes the old frame.
+        g_window.contentMinSize = NSMakeSize(640, 400);
+        g_window.collectionBehavior |= NSWindowCollectionBehaviorFullScreenPrimary;
         g_window.delegate = delegate;
         KrunView *view = [[KrunView alloc] initWithFrame:frame];
         // Layer-hosting (layer set before wantsLayer), so AppKit never

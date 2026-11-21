@@ -184,11 +184,11 @@ static void start_vm(void *arg) {
 }
 
 static void usage(void) {
-    fprintf(stderr, "usage: krun-vmm --kernel PATH --cmdline STR [--cpus N] [--mem MiB] "
+    fprintf(stderr, "usage: krun-vmm (--kernel PATH --cmdline STR [--initrd PATH] | --firmware EFI.fd) [--cpus N] [--mem MiB] "
                     "[--disk ID:PATH]... [--disk-ro ID:PATH]... [--virtiofs TAG:PATH]... "
                     "[--vsock-connect PORT:PATH]... [--vsock-listen PORT:PATH]... "
                     "[--gpu none|venus] [--gpu-flags N] [--gpu-shm BYTES] "
-                    "[--console PATH] [--display WxH] [--title STR] "
+                    "[--console PATH | --console-stdio 1] [--display WxH] [--title STR] "
                     "[--gvproxy BIN --net-socket PATH --net-mac MAC] [--log-level N]\n");
 }
 
@@ -200,7 +200,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "krun-vmm: parent already exited\n");
         return 1;
     }
-    const char *kernel = NULL, *cmdline = NULL, *console = NULL, *title = "krun";
+    const char *kernel = NULL, *initrd = NULL, *firmware = NULL, *cmdline = NULL, *console = NULL, *title = "krun";
     unsigned display_w = 0, display_h = 0;
     const char *gvproxy = NULL, *net_socket = NULL;
     uint8_t net_mac[6];
@@ -208,6 +208,7 @@ int main(int argc, char **argv) {
     unsigned long cpus = 2, mem = 1024, log_level = 1;
     uint32_t gpu_flags = 0;
     bool gpu_flags_raw = false;
+    bool console_stdio = false;
     uint64_t gpu_shm = 16ULL << 30;
 
     // First pass: scalars, so the context can be configured in one go.
@@ -219,8 +220,11 @@ int main(int argc, char **argv) {
             return 2;
         }
         if (!strcmp(a, "--kernel")) kernel = v;
+        else if (!strcmp(a, "--firmware")) firmware = v;
+        else if (!strcmp(a, "--initrd")) initrd = v;
         else if (!strcmp(a, "--cmdline")) cmdline = v;
         else if (!strcmp(a, "--console")) console = v;
+        else if (!strcmp(a, "--console-stdio")) console_stdio = strcmp(v, "0") != 0;
         else if (!strcmp(a, "--title")) title = v;
         else if (!strcmp(a, "--gvproxy")) gvproxy = v;
         else if (!strcmp(a, "--net-socket")) net_socket = v;
@@ -257,7 +261,9 @@ int main(int argc, char **argv) {
             return 2;
         }
     }
-    if (!kernel || !cmdline || cpus == 0 || cpus > 255 || mem == 0) {
+    // --firmware boots an EFI image (e.g. libkrun's KRUN_EFI.silent.fd), which
+    // then boots whatever disk is attached (a distro live ISO works as a raw disk).
+    if (!!kernel == !!firmware || (kernel && !cmdline) || cpus == 0 || cpus > 255 || mem == 0) {
         usage();
         return 2;
     }
@@ -320,17 +326,32 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    if (display_w && gpu_flags == 0) {
+    // Debug/benchmark override of the virglrenderer flags (e.g. adding
+    // THREAD_SYNC=2 | ASYNC_FENCE_CB=256 to VENUS=64 | NO_VIRGL=128).
+    const char *env_flags = getenv("KRUN_VMM_GPU_FLAGS");
+    if (env_flags && gpu_flags != 0) {
+        gpu_flags = (uint32_t)strtoul(env_flags, NULL, 0);
+        fprintf(stderr, "krun-vmm: GPU flags overridden: 0x%x\n", gpu_flags);
+    }
+        if (display_w && gpu_flags == 0) {
         fprintf(stderr, "krun-vmm: --display needs a GPU mode (--gpu venus)\n");
         return 2;
     }
     if (gpu_flags != 0) {
         CHECK(krun_set_gpu_options2((uint32_t)ctx, gpu_flags, gpu_shm));
     }
-    if (console) {
+    if (console_stdio) {
+        // Interactive hvc0 on our stdin/stdout (run under a terminal, e.g. tmux):
+        // distros start a getty there, which gives a shell in firmware-booted guests.
+        CHECK(krun_add_virtio_console_default((uint32_t)ctx, STDIN_FILENO, STDOUT_FILENO, STDOUT_FILENO));
+    } else if (console) {
         CHECK(krun_set_console_output((uint32_t)ctx, console));
     }
-    CHECK(krun_set_kernel((uint32_t)ctx, kernel, KRUN_KERNEL_FORMAT_RAW, NULL, cmdline));
+    if (firmware) {
+        CHECK(krun_set_firmware((uint32_t)ctx, firmware));
+    } else {
+        CHECK(krun_set_kernel((uint32_t)ctx, kernel, KRUN_KERNEL_FORMAT_RAW, initrd, cmdline));
+    }
 
     pthread_t watchdog;
     if (pthread_create(&watchdog, NULL, parent_watchdog, (void *)(intptr_t)parent) == 0) {
